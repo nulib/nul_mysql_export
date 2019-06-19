@@ -1,0 +1,273 @@
+#!/usr/bin/perl -wT
+
+###
+# THIS FILE IS MANAGED BY PUPPET -- DO NOT MODIFY
+###
+
+use strict;
+use POSIX;
+use File::stat;
+
+####
+# mysql_backup.pl
+# ---------------
+#
+# Created by: Steve DiDomenico
+# Date: 10-28-2004
+#
+# This program exports some of our MySQL database files using mysqldump.
+# Each database listed in the MYSQLTAB file will be exported
+# If the dump fails, the mostly-empty sql file will be deleted
+# If the dump is successful, the sql file will be gzipped
+#
+# Files are datestamped. Error messages are sent to STDERR.
+#
+# 2014-09-09 - steve    - Moved password variable to separate file, broke out reading databases
+#                         into its own separate function. 
+#                         TODO: This change history should probably be put into the code repo.
+# 2008-10-22 - steve    - Fixed bug where the file purge wasn't working, added global variable
+#                         to designate how long files should be kept
+# 2007-05-29 - steve    - updated for welles-b: mysqldump location changed
+#                         and using root mysql user now for backup
+# 2006-05-09 - dca      - change output dir to dl/mysqlbackup
+# 2006-07-03 - dca      - add command to purge old stuff
+# 2006-08-06 - ng       - untainted old backup-file purge
+#
+####
+
+my $input;
+my $MYSQLTAB= "/usr/local/admin/mysql-conf/mysqltab";
+my $MYSQLPASS="/usr/local/admin/mysql-conf/mysqlpass";
+my $FILEDIR = '/var/mysqlbackup';
+my $DAYS_BEFORE_DELETE = '<%= @mysql_days_before_delete %>'; # number of days before deleting old exports
+
+BEGIN {
+	$|=1; #autoflush on
+	$ENV{"PATH"} = "/bin;/usr/bin"; # make taint happy
+}
+
+main();
+
+
+
+###
+# read_mysqlpass
+# -------------
+# Reads in a file containing the MySQL password
+# Requires: the location of where the MySQL password file is
+# Returns : a string containing the password
+###
+sub read_mysqlpass
+{
+    my ($passfile) = @_;
+    my $input;
+    my $password;
+    my @databases = ();
+    
+    open (MYSQLPASS, "<$passfile")|| die "can't open $passfile";
+    while (<MYSQLPASS>) {
+        $input= $_;
+        chomp $input;
+        if ($input =~ /^([-_\w]+)$/) {
+            $password = $1;
+        } 
+        else {
+            die "bad password in $passfile";
+        }
+    }
+    close MYSQLPASS;
+
+    return($password);
+}
+
+
+###
+# read_mysqltab
+# -------------
+# Reads in a file containing the list of MySQL tables
+# Requires: the location of where the MySQL table file is
+# Returns : an array of the list of tables
+###
+sub read_mysqltab
+{
+    my ($tabfile) = @_;
+    my $input;
+    my $database;
+    my @databases = ();
+    
+    open (MYSQLTAB, "<$tabfile")|| die "can't open $tabfile";
+    while (<MYSQLTAB>) {
+        $input= $_;
+        chomp $input;
+        if ($input =~ /^([-_\w]+)$/) {
+            $database= $1;
+        } 
+        else {
+            die "bad database in $tabfile";
+        }
+        push (@databases, $database);
+    }
+    close MYSQLTAB;
+
+    return(@databases);
+}
+
+
+###
+# run_command
+# -----------
+# Simply runs a shell command
+# Requires: a system command
+# Returns: error message if any
+###
+sub run_command 
+{
+	my (@cmd) = @_;
+	#print STDERR "# run: \"", join(",",@cmd), "\"\n";
+	my ($ret) = system(@cmd);
+
+	print "ret=$ret\n" if ($ret);
+	return($ret);
+}
+
+
+###
+# export_database
+# ---------------
+# Exports a given mysql database using mysqldump
+# Requires: the database name, datestamp
+# Returns: error message if any
+###
+sub export_database
+{
+  my ($d, $date, $password) = @_;
+  my $ret;
+  ($ret) = run_command("/usr/bin/mysqldump -u root --password=$password --opt $d > $FILEDIR/$date-$d.sql");
+
+  return ($ret);
+}
+
+
+###
+# gzip_file
+# ---------
+# Gzips a given file. -f is used to prevent the script from hanging if the file
+# already exists.
+# Requires: the database name, datestamp
+# Returns: error message if any
+###
+sub gzip_file
+{
+  my ($d, $date) = @_;
+  my $ret;
+  ($ret) = run_command("/usr/bin/gzip -f $FILEDIR/$date-$d.sql"); # -f in case file exists
+
+  return ($ret);  
+}
+
+
+###
+# remove_file
+# -----------
+# Removes an sql file. This is used if the dump wasn't successful.
+# Requires: the database name, datestamp
+# Returns: error message if any
+###
+sub remove_file
+{
+  my ($d, $date) = @_;
+  my $ret;
+  ($ret) = run_command("/bin/rm $FILEDIR/$date-$d.sql");
+  return ($ret);  
+}
+
+
+###
+# print_message
+# -------------
+# Prints out a message to standard output. Adds a date and timestamp to
+# each message.
+# Requires: a message string
+###
+sub print_message
+{
+  my ($mess) = @_;
+  my $printdate = strftime("%Y-%m-%d %T", localtime(time));
+  
+  print "$printdate - $mess";
+}
+
+
+###
+# delete_old_files
+# ----------------
+# Deletes old db export files if they're older than a certain age.
+###
+sub delete_old_files
+{
+  while(<$FILEDIR/*.gz>) {
+  	my $file = $_;
+  	
+  	if ($file =~ m/($FILEDIR\/.+?\.gz)/) { #make taint happy
+  		$file = $1;
+  	}
+  	
+  	my $attrs = stat($file);
+  	my $ret;
+  	
+    if (-f and ((time - $attrs->mtime) > ($DAYS_BEFORE_DELETE * 86500))) {
+      if ($ret = run_command('/bin/rm', $file)) {
+        print_message("Failed to remove old export file $file; rc = $ret\n");
+      }
+      else {
+        print_message("Removed old export file: $file\n");
+      }
+    }
+  };
+}
+
+
+###
+# main
+# ----
+###
+sub main
+{
+  my $ret;
+  my $date = strftime("%Y%m%d", localtime(time));
+  my $password = '';
+  my @databases = ();
+
+  print_message("MySQL database export started.\n");
+
+    $password = read_mysqlpass($MYSQLPASS);
+    @databases = read_mysqltab($MYSQLTAB);
+
+   foreach my $d (@databases) {
+     ($ret) = export_database($d, $date, $password);
+     if ($ret) {
+       print STDERR "Problem exporting database '$d' due to the error: $ret\n";
+       ($ret) = remove_file($d, $date);
+       if ($ret) {
+         print STDERR "Problem removing unfinished database file " .
+                      "$FILEDIR/$d-$date.sql due to the error: $ret\n";
+       }
+     }
+     else {
+       ($ret) = gzip_file($d, $date);
+       if ($ret) {
+         print STDERR "Problem gzipping exported database file '$d' due to " .
+                      "the error: $ret\n";
+       }
+       else {
+         print_message("Successfully exported and gzipped database: $d\n");
+       }
+     }
+   }
+
+  delete_old_files();
+
+  print_message("MySQL database export completed.\n");
+  
+  exit(0);
+}
